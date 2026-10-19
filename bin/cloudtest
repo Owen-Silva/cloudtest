@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# PATH shim for cloudtest (bash, including Git Bash on Windows): runs cloudtest.js from this checkout.
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# On Git Bash, turn /c/... into C:/... for node.exe (path conversion is switched off below).
+if command -v cygpath >/dev/null 2>&1; then dir="$(cygpath -m "$dir")"; fi
+# MSYS_NO_PATHCONV stops Git Bash rewriting args like /etc/os-release into C:/Program Files/Git/...
+export MSYS_NO_PATHCONV=1
+exec node "$dir/cloudtest.js" "$@"

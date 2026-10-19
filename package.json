@@ -1,0 +1,23 @@
+{
+  "name": "cloudtest",
+  "version": "1.0.0",
+  "description": "Run a test command on a GitHub Actions runner against a snapshot of your working tree, without touching local git state",
+  "license": "MIT",
+  "author": "Owen Silva",
+  "bin": {
+    "cloudtest": "cloudtest.js"
+  },
+  "scripts": {
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "cloudtest.js",
+    "bin/",
+    "recipes/",
+    "README.md",
+    "LICENSE"
+  ]
+}

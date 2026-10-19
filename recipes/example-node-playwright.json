@@ -1,0 +1,11 @@
+{
+  "description": "EXAMPLE: a Node project's unit tests plus a Playwright end-to-end suite on a Linux runner. Copy this file into your local recipes dir (recipes.local/), rename it, and set \"repo\" to your repo. Judge the run by the test runner's summary line",
+  "repo": "your-name/your-repo",
+  "os": "linux",
+  "node": "22",
+  "setup": "npx playwright install --with-deps chromium",
+  "artifacts": ["playwright-report/**", "test-results/**"],
+  "timeout": 20,
+  "env": { "CI": "1" },
+  "command": "npm test && npx playwright test"
+}

@@ -1,0 +1,10 @@
+# Personal, machine-local files: never commit these (see README "Configure").
+/recipes.local/
+/config.local.json
+*.local.json
+
+# Run output, logs and dependencies.
+.cloudtest/
+.cloudtest-job/
+node_modules/
+*.log
