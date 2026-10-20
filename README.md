@@ -13,8 +13,9 @@ untracked files, and your local repo state (index, HEAD, branches, stash) is nev
 > expire. cloudtest refuses public repos unless you pass `--allow-public`. Only pass it from a tree that holds nothing
 > you would not publish.
 
-![cloudtest run in a terminal](docs/screenshot.png)
-<!-- TODO: add docs/screenshot.png (a real terminal capture of a cloudtest run). No image is committed yet. -->
+![A cloudtest run in a terminal: snapshot, push to a cloudtest/* branch, the Actions job's steps, branch deleted, the last lines of the test output, then the PASS summary line](docs/screenshot.png)
+
+*A real run, as cloudtest printed it: a Python unittest suite on a Linux runner. Only the repo name is replaced with `you/your-project`.*
 
 ```
 cloudtest [options] -- <test command>
