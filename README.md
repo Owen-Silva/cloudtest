@@ -9,9 +9,11 @@ untracked files, and your local repo state (index, HEAD, branches, stash) is nev
 > the repo's own `origin` on GitHub. On a **public** repo, anyone can see that snapshot commit, the full run log (your
 > test command, its output, and any `--env` values, which are written into the injected workflow file), and any
 > uploaded artifacts. Deleting the branch afterwards does not hide them. The commit stays reachable by its SHA, the
-> run and its log stay in the Actions tab until you delete the run, and artifacts stay downloadable until they
-> expire. cloudtest refuses public repos unless you pass `--allow-public`. Only pass it from a tree that holds nothing
-> you would not publish.
+> run and its log stay in the Actions tab until the run is deleted (cloudtest deletes it on a public repo once the
+> log is downloaded), and artifacts stay downloadable until they expire. cloudtest refuses public repos unless you
+> pass `--allow-public`. Only pass it from a tree that holds nothing you would not publish. To test a public repo
+> without publishing your work, use [`--committed`](#committed-mode-public-repos): it runs HEAD's already-pushed
+> commit only.
 
 ![A cloudtest run in a terminal: snapshot, push to a cloudtest/* branch, the Actions job's steps, branch deleted, the last lines of the test output, then the PASS summary line](docs/screenshot.png)
 
@@ -45,7 +47,7 @@ now, not what is on a branch. That is what cloudtest automates.
   `.github/workflows/cloudtest.yml`; GitHub rejects such a push over HTTPS without it. Add it
   with `gh auth refresh -s workflow`.
 - A repo whose `origin` is on **github.com**, with **Actions enabled**. Private repos are
-  the default; public repos need `--allow-public` (read the warning above).
+  the default; public repos need `--committed` or `--allow-public` (read the warning above).
 
 ## Install
 
@@ -100,6 +102,7 @@ cloudtest --recipes                                          # list recipes
 cloudtest --recipe my-e2e                                    # run a saved recipe (see "Recipes")
 cloudtest --recipe my-e2e --timeout 20 -- "npm run test:unit"   # recipe setup, other command
 cloudtest --env CI=1 -- npm test                             # env var for the setup and test steps
+cloudtest --committed -- npm test                            # HEAD's pushed commit only (public repos: free)
 ```
 
 ## Options
@@ -124,6 +127,8 @@ cloudtest --env CI=1 -- npm test                             # env var for the s
 | `--cleanup` | only sweep leftover `cloudtest/*` branches (see "Interrupts") |
 | `--allow-deploy-repo` | permit a repo on your deny list (see "Configure"; refused by default) |
 | `--allow-public` | permit a public repo (refused by default: the snapshot, log and artifacts would be public) |
+| `--committed` | snapshot HEAD's committed tree only, and only if HEAD is already on the remote. Allowed on public repos. See [Committed mode](#committed-mode-public-repos) |
+| `--keep-run` | on a public repo, keep the workflow run in the Actions tab (deleted by default once its log and artifacts are downloaded) |
 
 If you give exactly one argument after `--`, it is used as a shell string. If you give
 several, each one is quoted, so argv is preserved (`cloudtest -- npm test -- --grep "a b"`).
@@ -145,7 +150,8 @@ several, each one is quoted, so argv is preserved (`cloudtest -- npm test -- --g
 3. **Push a throwaway branch.** It pushes the commit to
    `refs/heads/cloudtest/<UTC timestamp>-<random>` with `--no-follow-tags
    --recurse-submodules=no`. The push goes to the origin URL, not the remote name, so no
-   local remote-tracking ref is created. `gh`'s token is the credential, so no credential
+   local remote-tracking ref is created (`--committed` pushes by name; see that section).
+   `gh`'s token is the credential, so no credential
    manager window opens. *Why:* a unique branch per run lets several runs go in parallel.
 4. **Watch.** It finds the run, then polls it every 5 s and prints one short line each time
    the status or step changes.
@@ -153,7 +159,8 @@ several, each one is quoted, so argv is preserved (`cloudtest -- npm test -- --g
    then saves the job log to `.cloudtest/<id>/log.txt`, prints the last 40 lines of the
    **test step's** output, and downloads artifacts to `.cloudtest/<id>/artifacts/`.
    `.cloudtest/<id>/run.json` holds the run URL, the snapshot sha, the exit code and the
-   billed minutes.
+   billed minutes. On a **public** repo it then records GitHub's run timing and deletes the
+   run from the Actions tab (`--keep-run` keeps it), and says which it did.
 6. **Exit with the test's own code.** The exit code is read from a marker the wrapper prints
    into the log, so `cloudtest -- npm test && deploy` behaves like the local command. If
    cloudtest itself fails (refusal, push error, no run appeared), it exits **125**.
@@ -168,6 +175,31 @@ one `cloudtest/*` branch cannot be restored by the next one.
 
 The tool is one file with no npm dependencies, so there is nothing to install or audit
 beyond Node, git and `gh`.
+
+## Committed mode (public repos)
+
+`--committed` (recipe key `"committed": true`) tests a commit that is already public instead of
+your working tree. Standard GitHub-hosted runners are free on public repos, so this is the way
+to run a heavy suite there. It also works on private repos (billed as usual).
+
+- **Snapshot = HEAD's committed tree.** The private index is read from HEAD, so uncommitted,
+  untracked and gitignored files never enter it; the summary line says how many local changes
+  were left out. `--include` is refused.
+- **HEAD must already be on the remote**, on a branch other than `cloudtest/*` (checked with a
+  fresh `git ls-remote`, then `git merge-base`, or GitHub's compare API for tips this clone
+  has never fetched). Otherwise it stops with `HEAD <sha> is not pushed yet` and pushes nothing.
+- **What becomes public anyway:** the snapshot commit adds only the injected job files: the
+  workflow (with your command and every `--env` value), `.cloudtest-job/`, and a recipe's
+  `setupFile`. Keep machine paths and private names out of them. On a public repo,
+  secret-looking `--env` keys are refused. The run log is public while the run exists.
+- **The run is deleted** from the Actions tab once its log and artifacts are downloaded
+  (`--keep-run` keeps it). Before deleting, cloudtest saves GitHub's run timing (billable ms
+  per OS) to `run.json` and prints it. It prints `billing: public repo, standard runner -> free`
+  (or the private-quota note) before the push.
+- **Pushed by remote name** (`origin`), not URL, so a pre-push hook that skips commits the
+  remote already has (a private-info scanner, say) checks only the snapshot commit, not the
+  whole history. Hooks run as usual; cloudtest never passes `--no-verify`. git records a
+  remote-tracking ref `origin/cloudtest/<id>` for the push; cloudtest deletes it with the branch.
 
 ## Recipes
 
@@ -186,7 +218,7 @@ example, `example-node-playwright.json`; copy it into `recipes.local/`, rename i
 - Only `repo` and `command` are required. `include` and `artifacts` take a string (comma
   separated) or an array. Write versions as strings (`"3.10"`, not `3.10`).
   Optional extras: `shell` (`bash`/`pwsh`), `install` (`false` = `--no-install`), `display` (true/false),
-  `fetchDepth` (number, `0` = full history).
+  `fetchDepth` (number, `0` = full history), `committed` (`true` = `--committed`).
   Unknown fields get a warning and are ignored; fields starting with `_` are ignored silently (use them for notes).
 - **Precedence:** a flag on the command line beats the recipe field. A command after `--`
   beats the recipe's `command`. `--include` / `--artifacts` given on the command line
@@ -211,7 +243,8 @@ example, `example-node-playwright.json`; copy it into `recipes.local/`, rename i
 ## Minutes and billing
 
 - Check your plan's included Actions minutes at github.com/settings/billing. Private-repo
-  minutes are metered; public repos are free (but see the warning at the top).
+  minutes are metered; public repos are free on standard runners (see the warning at the top, and
+  `--committed`). On a public repo the summary line says `billed ~0 min (<os>, public repo: free)`.
 - Each job is rounded **up to a whole minute**. A 6-second job bills 1 minute.
 - **Windows bills 2x**: a 21-second Windows job bills 2 minutes. macOS is not offered.
 - The summary line shows an estimate (`billed ~N min`), computed from job start and end
@@ -264,13 +297,15 @@ Hard refusals:
   patterns. The workflow gets `permissions: contents: read` and
   `persist-credentials: false`, and references no repo secrets.
 - **Size**: the tool refuses any file over 50 MB, and any snapshot over 200 MB in total.
-- **Public repos are refused** unless you pass `--allow-public`.
+- **Public repos are refused** unless you pass `--committed` (HEAD's pushed commit only) or
+  `--allow-public` (the working tree). A public repo's run is deleted after download.
 - The repo's **pre-push hook still runs** on the push. cloudtest does not skip hooks. If a
   hook runs the test suite locally, it defeats the purpose, so disable it for that repo yourself.
 
 ## Interrupts and leftovers
 
-On Ctrl-C (SIGINT/SIGTERM), cloudtest cancels the run and deletes the branch. If the process
+On Ctrl-C (SIGINT/SIGTERM), cloudtest cancels the run and deletes the branch. On a public
+repo the cancelled run is not deleted; cloudtest prints the `gh run delete` command for it. If the process
 is **hard-killed** (Task Manager, `kill -9`, a tool timeout), no handler runs. The branch
 stays behind, and the cloud job keeps going until it ends or hits `--timeout`. The next
 cloudtest run in that repo sweeps leftovers first. `cloudtest --cleanup` sweeps only. A sweep

@@ -4,6 +4,8 @@
 // not ignored) WITHOUT touching the real index/HEAD/branch/stash, pushes it to
 // a throwaway refs/heads/cloudtest/* branch, watches the run, downloads the
 // log + artifacts, deletes the branch, and exits with the test's exit code.
+// --committed snapshots HEAD's committed tree instead (HEAD must already be on
+// the remote), so a run on a public repo publishes nothing new but the job files.
 //
 // See README.md next to this file.
 'use strict';
@@ -55,7 +57,7 @@ const LOCAL_RECIPES_DIR = path.resolve(process.env.CLOUDTEST_RECIPES_DIR || path
 const RECIPE_DIRS = [...new Set([LOCAL_RECIPES_DIR, RECIPES_DIR])];
 const RECIPE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RECIPE_KEYS = new Set(['description', 'repo', 'os', 'node', 'python', 'setup', 'setupFile', 'include', 'artifacts',
-  'timeout', 'env', 'command', 'verified', 'shell', 'install', 'display', 'fetchDepth']);
+  'timeout', 'env', 'command', 'verified', 'shell', 'install', 'display', 'fetchDepth', 'committed']);
 const SETUP_FILE_DIR = '.cloudtest'; // setupFile lands at .cloudtest/setup.<ext> in the snapshot
 // --env / recipe env keys whose VALUES are never printed (masked as ***).
 const SECRET_KEY_RE = /secret|token|passw|pwd|key|credential|auth|cookie|session|private|signature|salt|cert/i;
@@ -200,6 +202,14 @@ options:
                          Refuses .env*, *.pem, *.key, names containing secret/token/credential,
                          any file over 50 MB, and a snapshot over 200 MB in total
   --allow-public         permit a PUBLIC repo (uncommitted work would be publicly visible)
+  --committed            test HEAD's COMMITTED tree only: uncommitted and untracked files are ignored,
+                         --include is refused, and HEAD must already be on a branch of the remote.
+                         Works on public repos without --allow-public (their standard runners are
+                         free); there, secret-looking --env keys are refused, because the injected
+                         workflow (command + env values) and the run log are public. Recipe key
+                         "committed": true does the same
+  --keep-run             on a public repo, keep the workflow run in the Actions tab (by default it is
+                         deleted once the log and artifacts are downloaded)
   -h, --help             this text
 
 One argument after -- is used as a shell string ("npm test && npm run e2e").
@@ -262,7 +272,7 @@ function loadRecipe(name) {
       throw new CloudtestError(`${from}: "${k}" must be a string or an array of strings`);
     }
   }
-  for (const k of ['install', 'display']) {
+  for (const k of ['install', 'display', 'committed']) {
     if (r[k] != null && typeof r[k] !== 'boolean') throw new CloudtestError(`${from}: "${k}" must be true or false`);
   }
   if (r.env != null && (typeof r.env !== 'object' || Array.isArray(r.env))) throw new CloudtestError(`${from}: "env" must be an object of KEY: value`);
@@ -331,6 +341,7 @@ function applyRecipe(o, r, set) {
   if (r.install != null && !set.has('install')) o.install = r.install;
   if (r.display != null && !set.has('display')) o.display = r.display;
   if (r.fetchDepth != null && !set.has('fetchDepth')) o.fetchDepth = r.fetchDepth;
+  if (r.committed === true) o.committed = true; // a recipe can only turn committed mode ON
   // Lists: any --include / --artifacts flag REPLACES the recipe's list.
   if (r.include != null && !set.has('include')) o.include = [].concat(r.include).map(normInclude);
   if (r.artifacts != null && !set.has('artifacts')) o.artifacts = [].concat(r.artifacts).flatMap(splitGlobs);
@@ -349,6 +360,7 @@ function parseArgs(argv) {
     display: null, install: true, shell: 'bash', dryRun: false, allowDeploy: false,
     allowPublic: false, command: null, help: false, include: [],
     fetchDepth: null, env: {}, recipeName: null, recipe: null, setupFile: null, listRecipes: false,
+    committed: false, keepRun: false,
   };
   const set = new Set(); // options given on the command line; they beat recipe fields
   const takesValue = new Set(['--os', '--setup', '--artifacts', '--node', '--python', '--timeout', '--shell', '--include', '--recipe', '--env', '--fetch-depth']);
@@ -391,6 +403,8 @@ function parseArgs(argv) {
       case '--cleanup': o.cleanup = true; break;
       case '--allow-deploy-repo': o.allowDeploy = true; break;
       case '--allow-public': o.allowPublic = true; break;
+      case '--committed': o.committed = true; break;
+      case '--keep-run': o.keepRun = true; break;
       default: throw new CloudtestError(`unknown option ${a} (put the test command after --)`);
     }
     i++;
@@ -401,6 +415,11 @@ function parseArgs(argv) {
     set.add('command');
   }
   if (o.recipeName) applyRecipe(o, loadRecipe(o.recipeName), set);
+  if (o.committed && o.include.length) {
+    throw new CloudtestError(`--include is refused with --committed: committed mode snapshots HEAD's committed tree only, and ` +
+      `--include force-adds gitignored files (${o.include.join(', ')}${o.recipe && !set.has('include') ? `, from recipe ${o.recipe.name}` : ''}). ` +
+      'Commit what the test needs, or run without --committed.');
+  }
   // Secret-looking env values are scrubbed from every line cloudtest prints or saves.
   for (const [k, v] of Object.entries(o.env)) if (isSecretKey(k) && v.length >= 3) SECRET_VALUES.push(v);
   if (!['linux', 'windows'].includes(o.os)) throw new CloudtestError('--os must be linux or windows');
@@ -476,13 +495,58 @@ async function remoteRepoChecks(repo, o) {
   const info = JSON.parse(r.stdout);
   assertNotDeployRepo(info.full_name, o); // catches renames/redirects
   if (info.archived) throw new CloudtestError(`${info.full_name} is archived; cannot push`);
-  if (!info.private && !o.allowPublic) {
-    throw new CloudtestError(`REFUSED: ${info.full_name} is PUBLIC. The snapshot (including uncommitted work) would be publicly visible. Pass --allow-public to override.`);
+  if (!info.private && !o.allowPublic && !o.committed) {
+    throw new CloudtestError(`REFUSED: ${info.full_name} is PUBLIC. The snapshot (including uncommitted work) would be publicly visible. ` +
+      'Use --committed to test HEAD\'s already-pushed commit instead (public repos run free), or pass --allow-public to publish the working tree.');
+  }
+  if (!info.private && o.committed) {
+    const secretKeys = Object.keys(o.env).filter(isSecretKey);
+    if (secretKeys.length) {
+      throw new CloudtestError(`REFUSED: ${info.full_name} is PUBLIC, and env key(s) ${secretKeys.join(', ')} look secret. In committed mode on a ` +
+        'public repo every env value is written into the injected workflow file and the run log, both public. Drop them ' +
+        '(--env / recipe "env"), or use a private repo.');
+    }
   }
   const p = await run('gh', ['api', `repos/${info.full_name}/actions/permissions`, '--jq', '.enabled']);
   if (p.code === 0 && p.stdout.trim() === 'false') throw new CloudtestError(`GitHub Actions is disabled on ${info.full_name}`);
   repo.fullName = info.full_name;
+  repo.isPublic = !info.private;
   return info;
+}
+
+// --committed: HEAD must already be reachable from a branch on the remote (cloudtest/* branches do not
+// count), so the run publishes no commit that is not already there. The branch tips come from a fresh
+// git ls-remote. A tip that is also in the local object store has the same history here and there
+// (a commit id covers its parents), so git merge-base answers locally; for tips this clone has never
+// seen, GitHub's compare API says whether HEAD is behind (an ancestor of) the tip. Fails closed.
+async function assertHeadPushed(repo, defaultBranch) {
+  if (!repo.head) throw new CloudtestError('REFUSED (--committed): this repo has no commits yet, so there is nothing pushed to test');
+  const notPushed = (why) => new CloudtestError(
+    `REFUSED (--committed): HEAD ${repo.head.slice(0, 7)} is not pushed yet: ${why}. Committed mode only runs a commit that is ` +
+    'already on the remote, so the run publishes nothing new. Push it first (git push), or run without --committed.');
+  const ls = await run('git', [...ghCredArgs(repo.pushUrl), 'ls-remote', '--heads', repo.pushUrl], { cwd: repo.root, env: pushEnv() });
+  if (ls.code !== 0) throw new CloudtestError(`--committed: git ls-remote ${repo.fullName} failed, so cannot prove HEAD is pushed: ${(ls.stderr || '').trim().slice(0, 300)}`);
+  const tips = ls.stdout.split('\n').map((l) => l.trim().split('\t')).filter((x) => x.length === 2 && /^[0-9a-f]{40,64}$/.test(x[0]))
+    .map(([sha, ref]) => ({ sha, branch: ref.replace(/^refs\/heads\//, '') }))
+    .filter((t) => !t.branch.startsWith(BRANCH_PREFIX));
+  if (!tips.length) throw notPushed(`${repo.fullName} has no branches`);
+  tips.sort((a, b) => (b.branch === defaultBranch) - (a.branch === defaultBranch)); // default branch first
+  const exact = tips.find((t) => t.sha === repo.head);
+  if (exact) return exact.branch;
+  const unknown = [];
+  for (const t of tips) {
+    const have = await run('git', ['cat-file', '-e', `${t.sha}^{commit}`], { cwd: repo.root });
+    if (have.code !== 0) { unknown.push(t); continue; }
+    const anc = await run('git', ['merge-base', '--is-ancestor', repo.head, t.sha], { cwd: repo.root });
+    if (anc.code === 0) return t.branch;
+    if (anc.code !== 1) throw new CloudtestError(`--committed: git merge-base failed on ${t.branch}: ${(anc.stderr || '').trim().slice(0, 300)}`);
+  }
+  for (const t of unknown.slice(0, 20)) {
+    const c = await run('gh', ['api', `repos/${repo.fullName}/compare/${t.sha}...${repo.head}`, '--jq', '.status']);
+    if (c.code === 0 && ['behind', 'identical'].includes(c.stdout.trim())) return t.branch;
+  }
+  throw notPushed(`no branch of ${repo.fullName} contains it (checked ${tips.length} branch tip(s) from git ls-remote` +
+    `${unknown.length ? `, ${Math.min(unknown.length, 20)} of them through the GitHub compare API` : ''})`);
 }
 
 function ensureExcluded(excludePath) {
@@ -497,13 +561,14 @@ function ensureExcluded(excludePath) {
 }
 
 // ---------------------------------------------------------------- job files
-function detectProject(root, files) {
+// readText(rel) returns a file's text from the snapshot source (working tree, or HEAD in --committed mode).
+function detectProject(files, readText) {
   const has = (p) => files.has(p);
   const d = { node: false, python: false, lockfile: null, electron: false, requirements: false, pyproject: false, nvmrc: null, pyVersionFile: null, lfs: false };
   if (has('package.json')) {
     d.node = true;
     try {
-      const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      const pkg = JSON.parse(readText('package.json'));
       const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}), ...(pkg.optionalDependencies || {}) };
       d.electron = Object.keys(deps).some((k) => k === 'electron' || k === 'electron-nightly');
     } catch { /* unreadable package.json: no electron autodetect */ }
@@ -517,7 +582,7 @@ function detectProject(root, files) {
   if (has('pyproject.toml')) { d.python = true; d.pyproject = true; }
   if (has('.python-version')) d.pyVersionFile = '.python-version';
   if (has('.gitattributes')) {
-    try { d.lfs = /filter=lfs/.test(fs.readFileSync(path.join(root, '.gitattributes'), 'utf8')); } catch { /* ignore */ }
+    try { d.lfs = /filter=lfs/.test(readText('.gitattributes')); } catch { /* ignore */ }
   }
   return d;
 }
@@ -694,64 +759,80 @@ async function buildSnapshot(repo, o, id) {
   };
   const g = (args, extra = {}) => must('git', args, { cwd: repo.root, env, ...extra });
   try {
-    // Start from a COPY of the real index (keeps stat cache, so add -A is fast).
-    // The real index file is only read, never written.
-    if (fs.existsSync(repo.indexPath)) fs.copyFileSync(repo.indexPath, tmpIndex);
-    else if (repo.head) await g(['read-tree', repo.head]);
-
-    // Pre-flight on what add -A would pick up (modified + untracked-not-ignored),
-    // BEFORE hashing anything into the object store.
-    const cand = (await g(['ls-files', '-z', '-m', '-o', '--exclude-standard', '--', '.', ':(exclude).cloudtest'])).stdout
-      .split('\0').filter(Boolean);
-    const big = [];
-    const secret = [];
-    let preTotal = 0;
-    const checkFile = (rel, strict, secretList) => {
-      const base = rel.split('/').pop();
-      if (isSecretName(base, strict)) secretList.push(rel);
-      try {
-        const st = fs.statSync(path.join(repo.root, rel));
-        if (st.isFile()) {
-          preTotal += st.size;
-          if (st.size > MAX_FILE_BYTES) big.push(`${rel} (${fmtBytes(st.size)})`);
-          return st.size;
-        }
-      } catch { /* deleted file */ }
-      return 0;
-    };
-    for (const rel of new Set(cand)) checkFile(rel, false, secret);
-    if (secret.length) {
-      throw new CloudtestError(`REFUSED: the snapshot would include uncommitted secret-looking file(s): ${secret.join(', ')}. ` +
-        'Add them to .gitignore (or commit them if they are not secrets) and retry.');
-    }
-
-    // --include: everything untracked under the path, ignored or not (that is
-    // exactly what "git add -f <path>" will pick up). Strict secret rules apply.
     const included = [];
-    for (const inc of o.include) {
-      const files = (await g(['ls-files', '-z', '-o', '--', inc])).stdout.split('\0').filter(Boolean)
-        .filter((f) => !f.startsWith('.cloudtest/'));
-      const incSecret = [];
-      let bytes = 0;
-      for (const rel of files) bytes += checkFile(rel, true, incSecret);
-      if (incSecret.length) {
-        throw new CloudtestError(`REFUSED: --include ${inc} would pick up secret-looking file(s): ${incSecret.slice(0, 10).join(', ')}` +
-          `${incSecret.length > 10 ? ` (+${incSecret.length - 10} more)` : ''}. --include never takes .env*, *.pem, *.key or ` +
-          'names containing secret/token/credential. Narrow the path.');
-      }
-      if (!files.length && !fs.existsSync(path.join(repo.root, inc))) throw new CloudtestError(`--include ${inc}: path does not exist`);
-      included.push({ path: inc, files: files.length, bytes });
-    }
-    if (big.length) throw new CloudtestError(`REFUSED: file(s) over 50 MB would be in the snapshot: ${big.join(', ')}. Ignore or remove them.`);
-    if (preTotal > MAX_TOTAL_BYTES) {
-      throw new CloudtestError(`REFUSED: uncommitted + included files alone total ${fmtBytes(preTotal)} (limit ${fmtBytes(MAX_TOTAL_BYTES)}).`);
-    }
+    let leftOut = 0; // --committed: local changes NOT in the snapshot (staged, unstaged, untracked)
+    if (o.committed) {
+      // HEAD's committed tree and nothing else: the private index is read from HEAD, so uncommitted,
+      // untracked and ignored files never enter it.
+      await g(['read-tree', repo.head]);
+      // Count what is left out. Read-only against the REAL index (never refreshed or written).
+      const ro = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
+      delete ro.GIT_INDEX_FILE;
+      const staged = fs.existsSync(repo.indexPath)
+        ? (await must('git', ['diff-index', '--cached', '--name-only', '-z', repo.head, '--'], { cwd: repo.root, env: ro })).stdout.split('\0').filter(Boolean)
+        : [];
+      const local = (await must('git', ['ls-files', '-z', '-m', '-o', '--exclude-standard', '--', '.', ':(exclude).cloudtest'], { cwd: repo.root, env: ro }))
+        .stdout.split('\0').filter(Boolean);
+      leftOut = new Set([...staged, ...local]).size;
+    } else {
+      // Start from a COPY of the real index (keeps stat cache, so add -A is fast).
+      // The real index file is only read, never written.
+      if (fs.existsSync(repo.indexPath)) fs.copyFileSync(repo.indexPath, tmpIndex);
+      else if (repo.head) await g(['read-tree', repo.head]);
 
-    // Whole tree (cwd is the repo root). No exclude pathspec here: git add errors
-    // when a pathspec names an ignored path. .cloudtest/ is excluded via
-    // .git/info/exclude, and dropped again below in case it was ever tracked.
-    await g(['add', '-A']);
-    for (const inc of included) if (inc.files) await g(['add', '-f', '--', inc.path]);
+      // Pre-flight on what add -A would pick up (modified + untracked-not-ignored),
+      // BEFORE hashing anything into the object store.
+      const cand = (await g(['ls-files', '-z', '-m', '-o', '--exclude-standard', '--', '.', ':(exclude).cloudtest'])).stdout
+        .split('\0').filter(Boolean);
+      const big = [];
+      const secret = [];
+      let preTotal = 0;
+      const checkFile = (rel, strict, secretList) => {
+        const base = rel.split('/').pop();
+        if (isSecretName(base, strict)) secretList.push(rel);
+        try {
+          const st = fs.statSync(path.join(repo.root, rel));
+          if (st.isFile()) {
+            preTotal += st.size;
+            if (st.size > MAX_FILE_BYTES) big.push(`${rel} (${fmtBytes(st.size)})`);
+            return st.size;
+          }
+        } catch { /* deleted file */ }
+        return 0;
+      };
+      for (const rel of new Set(cand)) checkFile(rel, false, secret);
+      if (secret.length) {
+        throw new CloudtestError(`REFUSED: the snapshot would include uncommitted secret-looking file(s): ${secret.join(', ')}. ` +
+          'Add them to .gitignore (or commit them if they are not secrets) and retry.');
+      }
+
+      // --include: everything untracked under the path, ignored or not (that is
+      // exactly what "git add -f <path>" will pick up). Strict secret rules apply.
+      for (const inc of o.include) {
+        const files = (await g(['ls-files', '-z', '-o', '--', inc])).stdout.split('\0').filter(Boolean)
+          .filter((f) => !f.startsWith('.cloudtest/'));
+        const incSecret = [];
+        let bytes = 0;
+        for (const rel of files) bytes += checkFile(rel, true, incSecret);
+        if (incSecret.length) {
+          throw new CloudtestError(`REFUSED: --include ${inc} would pick up secret-looking file(s): ${incSecret.slice(0, 10).join(', ')}` +
+            `${incSecret.length > 10 ? ` (+${incSecret.length - 10} more)` : ''}. --include never takes .env*, *.pem, *.key or ` +
+            'names containing secret/token/credential. Narrow the path.');
+        }
+        if (!files.length && !fs.existsSync(path.join(repo.root, inc))) throw new CloudtestError(`--include ${inc}: path does not exist`);
+        included.push({ path: inc, files: files.length, bytes });
+      }
+      if (big.length) throw new CloudtestError(`REFUSED: file(s) over 50 MB would be in the snapshot: ${big.join(', ')}. Ignore or remove them.`);
+      if (preTotal > MAX_TOTAL_BYTES) {
+        throw new CloudtestError(`REFUSED: uncommitted + included files alone total ${fmtBytes(preTotal)} (limit ${fmtBytes(MAX_TOTAL_BYTES)}).`);
+      }
+
+      // Whole tree (cwd is the repo root). No exclude pathspec here: git add errors
+      // when a pathspec names an ignored path. .cloudtest/ is excluded via
+      // .git/info/exclude, and dropped again below in case it was ever tracked.
+      await g(['add', '-A']);
+      for (const inc of included) if (inc.files) await g(['add', '-f', '--', inc.path]);
+    }
     await g(['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', '.cloudtest']);
 
     // Drop the repo's own workflows (snapshot only) so its CI never fires.
@@ -762,7 +843,21 @@ async function buildSnapshot(repo, o, id) {
 
     // Detect project type from the snapshot's file list.
     const fileSet = new Set((await g(['ls-files', '-z'])).stdout.split('\0').filter(Boolean));
-    const d = detectProject(repo.root, fileSet);
+    // Contents come from the same source as the snapshot: HEAD's blobs in --committed mode, else the working tree.
+    const texts = {};
+    for (const p of ['package.json', '.gitattributes']) {
+      if (!fileSet.has(p)) continue;
+      if (o.committed) {
+        const r = await run('git', ['cat-file', 'blob', `${repo.head}:${p}`], { cwd: repo.root });
+        if (r.code === 0) texts[p] = r.stdout;
+      } else {
+        try { texts[p] = fs.readFileSync(path.join(repo.root, p), 'utf8'); } catch { /* unreadable: no autodetect from it */ }
+      }
+    }
+    const d = detectProject(fileSet, (p) => {
+      if (texts[p] == null) throw new Error(`${p} unreadable`);
+      return texts[p];
+    });
     const job = buildJob(o, d, { id, head: repo.head });
     for (const [p, content] of Object.entries(job.files)) {
       const sha = (await g(['hash-object', '-w', '--stdin', '--no-filters'], { input: content })).stdout.trim();
@@ -796,10 +891,11 @@ async function buildSnapshot(repo, o, id) {
         `:(exclude)${JOB_DIR}`, `:(exclude)${SETUP_FILE_DIR}`, ":(exclude).github/workflows"])).stdout.split('\n').filter(Boolean);
     }
 
-    const commitArgs = ['commit-tree', tree, '-m', `cloudtest snapshot ${id}`, '-m', `base: ${repo.head || '(none)'}`];
+    const commitArgs = ['commit-tree', tree, '-m', `cloudtest snapshot ${id}`,
+      '-m', `base: ${repo.head || '(none)'}${o.committed ? ' (committed tree only)' : ''}`];
     if (repo.head) commitArgs.splice(2, 0, '-p', repo.head);
     const commit = (await g(commitArgs)).stdout.trim();
-    return { commit, tree, count, total, changed, removedWorkflows: wf, detect: d, job, included };
+    return { commit, tree, count, total, changed, leftOut, removedWorkflows: wf, detect: d, job, included };
   } finally {
     for (const f of [tmpIndex, `${tmpIndex}.lock`]) { try { fs.unlinkSync(f); } catch { /* gone */ } }
   }
@@ -813,14 +909,34 @@ function ghCredArgs(url) {
 }
 const pushEnv = () => ({ ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_OPTIONAL_LOCKS: '0' });
 
-async function pushSnapshot(repo, sha, ref) {
+async function pushSnapshot(repo, sha, ref, byName) {
   if (!SAFE_REF_RE.test(ref)) throw new CloudtestError(`internal safety stop: refusing to push to ${ref}`);
   if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new CloudtestError('internal safety stop: bad snapshot sha');
-  // Push to the URL (not the remote name): no remote-tracking ref is created
+  // Default: push to the URL (not the remote name): no remote-tracking ref is created
   // locally, and remote.origin.push / mirror config cannot widen the refspec.
+  // --committed pushes to the remote NAME instead, so a pre-push hook knows which remote it is
+  // and can skip the commits that remote already has (HEAD's history, proven pushed); given a
+  // bare URL, a hook cannot tell and rescans the whole history. The explicit refspec still
+  // pushes this one ref (mirror config makes git refuse it). git records a remote-tracking
+  // ref origin/cloudtest/<id> for it, which dropTrackingRef() deletes with the branch.
   const args = [...ghCredArgs(repo.pushUrl), 'push', '--no-follow-tags', '--recurse-submodules=no', '--quiet',
-    repo.pushUrl, `${sha}:${ref}`];
-  await must('git', args, { cwd: repo.root, env: pushEnv(), what: 'git push' });
+    byName ? 'origin' : repo.pushUrl, `${sha}:${ref}`];
+  const r = await must('git', args, { cwd: repo.root, env: pushEnv(), what: 'git push' });
+  // A successful --quiet push prints only what hooks and the remote said. Show the hooks' lines
+  // (the remote's "remote: ..." lines are GitHub's pull-request / moved-repo notes).
+  const hookLines = String(r.stderr || '').split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l && !/^remote:/.test(l));
+  for (const line of hookLines.slice(0, 20)) say(`push: ${line}`);
+}
+
+// --committed only: the remote-tracking ref git wrote for the by-name push. Deleted only while it
+// still points at this run's snapshot.
+async function dropTrackingRef(repo, ref, sha) {
+  if (!SAFE_REF_RE.test(ref) || !sha) return;
+  const tracking = ref.replace(/^refs\/heads\//, 'refs/remotes/origin/');
+  const cur = await run('git', ['rev-parse', '--verify', '-q', tracking], { cwd: repo.root });
+  if (cur.code !== 0 || cur.stdout.trim() !== sha) return;
+  const d = await run('git', ['update-ref', '-d', tracking, sha], { cwd: repo.root });
+  if (d.code !== 0) warn(`could not delete the local remote-tracking ref ${tracking}; git fetch --prune removes it`);
 }
 
 let deletePromise = null;
@@ -1008,11 +1124,22 @@ async function main() {
   const branch = `${BRANCH_PREFIX}${id}`;
   const ref = `refs/heads/${branch}`;
 
-  await remoteRepoChecks(repo, o);
+  const info = await remoteRepoChecks(repo, o);
   if (o.cleanup) {
     const n = await sweepStale(repo, null);
     say(`cleanup done: ${n} leftover branch(es) deleted`);
     return 0;
+  }
+  if (o.committed) {
+    const onBranch = await assertHeadPushed(repo, info.default_branch);
+    say(`committed mode: HEAD ${repo.head.slice(0, 7)} is already on ${repo.fullName} (branch ${onBranch}); ` +
+      'the snapshot is its committed tree plus the job files');
+    say(repo.isPublic
+      ? 'billing: public repo, standard runner -> free'
+      : `billing: private repo -> counts against your included Actions minutes (${o.os === 'windows' ? 'windows bills 2x' : 'linux 1x'})`);
+    const hooks = await run('git', ['rev-parse', '--git-path', 'hooks'], { cwd: repo.root });
+    const prePush = hooks.code === 0 ? path.resolve(repo.root, hooks.stdout.trim(), 'pre-push') : null;
+    say(prePush && fs.existsSync(prePush) ? `pre-push hook: ${prePush} (runs on the snapshot push)` : 'pre-push hook: none (nothing scans the snapshot before it is pushed)');
   }
   ensureExcluded(repo.excludePath);
   if (!o.dryRun) await sweepStale(repo, ref);
@@ -1020,7 +1147,8 @@ async function main() {
   const snap = await buildSnapshot(repo, o, id);
   const nUncommitted = snap.changed.length;
   say(`snapshot ${snap.commit.slice(0, 7)}  ${snap.count} files  ${fmtBytes(snap.total)}  base ${repo.head ? repo.head.slice(0, 7) : '(no commits)'}  ` +
-    `${nUncommitted} uncommitted change(s)${snap.removedWorkflows.length ? `  (${snap.removedWorkflows.length} repo workflow(s) removed in snapshot)` : ''}`);
+    (o.committed ? `committed tree only (${snap.leftOut} local change(s) left out)` : `${nUncommitted} uncommitted change(s)`) +
+    `${snap.removedWorkflows.length ? `  (${snap.removedWorkflows.length} repo workflow(s) removed in snapshot)` : ''}`);
   for (const inc of snap.included) {
     say(`--include ${inc.path}: ${inc.files ? `${inc.files} gitignored/untracked file(s), ${fmtBytes(inc.bytes)} force-added` : 'nothing untracked there (already in the snapshot if tracked)'}`);
   }
@@ -1028,7 +1156,8 @@ async function main() {
   if (o.dryRun) {
     const d = snap.detect;
     say(`DRY RUN: nothing pushed`);
-    say(`push target: ${repo.fullName} ${ref}`);
+    say(`push target: ${repo.fullName} ${ref}${o.committed ? ' (pushed to the remote by name, origin)' : ''}`);
+    if (repo.isPublic) say(`public repo: the run would be ${o.keepRun ? 'KEPT (--keep-run)' : 'deleted from the Actions tab once its log and artifacts are downloaded'}`);
     say(`os ${o.os}  node ${snap.job.useNode ? 'yes' : 'no'}  python ${snap.job.usePython ? 'yes' : 'no'}  lockfile ${d.lockfile || '-'}  ` +
       `xvfb ${snap.job.display ? 'yes' : 'no'}  timeout ${o.timeout}m  command: ${o.command}`);
     if (snap.changed.length) say(`uncommitted vs HEAD: ${snap.changed.slice(0, 20).join(' | ')}${snap.changed.length > 20 ? ' | ...' : ''}`);
@@ -1040,19 +1169,30 @@ async function main() {
 
   const outDir = path.join(repo.root, '.cloudtest', id);
   fs.mkdirSync(outDir, { recursive: true });
-  const meta = { id, repo: repo.fullName, branch, base: repo.head, snapshot: snap.commit, os: o.os, command: o.command, recipe: o.recipe ? o.recipe.name : null, startedAt: now.toISOString() };
+  const meta = { id, repo: repo.fullName, branch, base: repo.head, snapshot: snap.commit, mode: o.committed ? 'committed' : 'worktree', public: !!repo.isPublic,
+    os: o.os, command: o.command, recipe: o.recipe ? o.recipe.name : null, startedAt: now.toISOString() };
   const writeMeta = () => fs.writeFileSync(path.join(outDir, 'run.json'), JSON.stringify(meta, null, 2) + '\n');
   writeMeta();
 
   let runInfo = null;
   let branchMaybeExists = false;
+  let runDeleted = false;
+  let runNoted = false;
+  const runLeftNote = () => {
+    if (repo.isPublic && runInfo && !runDeleted && !o.keepRun && !runNoted) {
+      runNoted = true;
+      warn(`workflow run ${runInfo.databaseId} is still in the PUBLIC Actions tab; delete it with: gh run delete ${runInfo.databaseId} --repo ${repo.fullName}`);
+    }
+  };
   cleanup = async (interrupted) => {
     if (interrupted && runInfo) await run('gh', ['run', 'cancel', String(runInfo.databaseId), '--repo', repo.fullName]);
     if (branchMaybeExists) {
       const ok = await deleteRemoteBranch(repo, ref);
       if (ok) say(`deleted remote branch ${branch}`);
       else warn(`could NOT delete remote branch ${branch}; delete it with: git push origin --delete ${branch}`);
+      if (o.committed) await dropTrackingRef(repo, ref, snap.commit);
     }
+    if (interrupted) runLeftNote();
   };
 
   const wall0 = Date.now();
@@ -1060,7 +1200,7 @@ async function main() {
   try {
     say(`push -> ${repo.fullName} ${ref}`);
     branchMaybeExists = true;
-    await pushSnapshot(repo, snap.commit, ref);
+    await pushSnapshot(repo, snap.commit, ref, o.committed);
     if (aborted) return 130;
 
     runInfo = await findRun(repo, branch, snap.commit);
@@ -1099,6 +1239,26 @@ async function main() {
       else warn(`no artifacts downloaded (${(a.stderr || '').trim().split('\n')[0] || 'nothing matched the glob?'})`);
     }
 
+    // Public repo: record GitHub's timing (billable ms per OS) while the run exists, then delete the
+    // run (its log and artifacts are already here) so the public Actions tab keeps no copy.
+    if (repo.isPublic) {
+      const t = await run('gh', ['api', `repos/${repo.fullName}/actions/runs/${runInfo.databaseId}/timing`]);
+      try { if (t.code === 0) meta.timing = JSON.parse(t.stdout); } catch { /* unparseable: reported below */ }
+      say(meta.timing
+        ? `timing (GitHub API): billable ${JSON.stringify(meta.timing.billable || {})}, run_duration_ms ${meta.timing.run_duration_ms}`
+        : `could not read the run's timing from the GitHub API (${(t.stderr || '').trim().split('\n')[0]})`);
+      if (o.keepRun) {
+        say(`kept workflow run ${runInfo.databaseId} in the public Actions tab (--keep-run): ${runInfo.url}`);
+      } else {
+        const del = await run('gh', ['api', '-X', 'DELETE', `repos/${repo.fullName}/actions/runs/${runInfo.databaseId}`]);
+        runDeleted = del.code === 0;
+        if (runDeleted) say(`deleted workflow run ${runInfo.databaseId} from the public Actions tab (log and artifacts are in ${path.relative(process.cwd(), outDir) || outDir}; --keep-run keeps it)`);
+        else warn(`could NOT delete workflow run ${runInfo.databaseId}: ${(del.stderr || del.stdout || '').trim().split('\n')[0]}`);
+      }
+      meta.runDeleted = runDeleted;
+      writeMeta();
+    }
+
     const conclusion = final ? final.conclusion : 'unknown';
     if (section.exit != null) exitCode = section.exit;
     else if (conclusion === 'success') exitCode = 0;
@@ -1114,14 +1274,16 @@ async function main() {
     const completed = job && job.completedAt ? Date.parse(job.completedAt) : NaN;
     const jobMs = completed - started;
     const mult = o.os === 'windows' ? 2 : 1;
-    const billed = isFinite(jobMs) && jobMs > 0 ? Math.max(1, Math.ceil(jobMs / 60000)) * mult : 0;
+    // Standard GitHub-hosted runners are free on public repos.
+    const billed = repo.isPublic ? 0 : isFinite(jobMs) && jobMs > 0 ? Math.max(1, Math.ceil(jobMs / 60000)) * mult : 0;
     Object.assign(meta, { conclusion, exitCode, jobSeconds: isFinite(jobMs) ? Math.round(jobMs / 1000) : null, billedMinutes: billed, finishedAt: new Date().toISOString() });
     writeMeta();
     process.stdout.write(`${exitCode === 0 ? 'PASS' : 'FAIL'}  exit ${exitCode}  job ${fmtDur(jobMs)}  wall ${fmtDur(Date.now() - wall0)}  ` +
-      `billed ~${billed} min (${o.os}${mult > 1 ? ' x2' : ''})  ${runInfo.url}\n`);
+      `billed ~${billed} min (${o.os}${repo.isPublic ? ', public repo: free' : mult > 1 ? ' x2' : ''})  ${runInfo.url}${runDeleted ? ' (run deleted)' : ''}\n`);
     return exitCode;
   } finally {
     if (branchMaybeExists && !aborted) await cleanup(false);
+    if (!aborted) runLeftNote();
   }
 }
 
