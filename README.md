@@ -222,11 +222,18 @@ example, `example-node-playwright.json`; copy it into `recipes.local/`, rename i
 - Only `repo` and `command` are required. `include` and `artifacts` take a string (comma
   separated) or an array. Write versions as strings (`"3.10"`, not `3.10`).
   Optional extras: `shell` (`bash`/`pwsh`), `install` (`false` = `--no-install`), `display` (true/false),
-  `fetchDepth` (number, `0` = full history), `committed` (`true` = `--committed`).
+  `fetchDepth` (number, `0` = full history), `committed` (`true` = `--committed`),
+  `githubToken` (`true` = see below).
   Unknown fields get a warning and are ignored; fields starting with `_` are ignored silently (use them for notes).
 - **Precedence:** a flag on the command line beats the recipe field. A command after `--`
   beats the recipe's `command`. `--include` / `--artifacts` given on the command line
   **replace** the recipe's list. `--env KEY=VAL` beats the recipe's `env.KEY`, and other keys are kept.
+- **`githubToken`:** off by default. With `"githubToken": true` the job env gets
+  `GITHUB_TOKEN: ${{ github.token }}`, the job's own token, read-only because the workflow keeps
+  `permissions: contents: read` (checkout still uses `persist-credentials: false`). Use it for tests
+  that call the GitHub API, which allows only 60 anonymous requests an hour per runner IP and far more
+  with a token. The value never passes through cloudtest; GitHub masks it as `***` in the log. Don't print it
+  from your test, and keep it out of anything you upload as an artifact.
 - **Repo check:** the recipe is refused unless `repo` matches this repo's origin
   (case-insensitive). The deny-list and public-repo refusals still run first.
 - **`setupFile`** is a file in the same folder as the recipe (a bare name, `.ps1` or `.sh`).

@@ -194,6 +194,40 @@ async function pushTargetTests() {
   check('a non-cloudtest ref is still refused', err && /internal safety stop/.test(err), err);
 }
 
+// ---- recipe "githubToken": opt-in GITHUB_TOKEN = the job's own token in the job env. Offline:
+// parseArgs + buildJob in-process against temp recipes; nothing is pushed.
+function githubTokenTests() {
+  const dir = path.join(tmp, 'recipes-token');
+  fs.mkdirSync(dir);
+  const base = { repo: 'me/proj', command: 'npm test' };
+  fs.writeFileSync(path.join(dir, 'tok-on.json'), JSON.stringify({ ...base, githubToken: true }));
+  fs.writeFileSync(path.join(dir, 'tok-off.json'), JSON.stringify({ ...base, githubToken: false }));
+  fs.writeFileSync(path.join(dir, 'tok-unset.json'), JSON.stringify(base));
+  fs.writeFileSync(path.join(dir, 'tok-bad.json'), JSON.stringify({ ...base, githubToken: 'yes' }));
+  process.env.CLOUDTEST_RECIPES_DIR = dir; // read once, when cloudtest.js is first required
+  process.env.CLOUDTEST_CONFIG = noConfig;
+  const ct = require(TOOL);
+  const LINE = '      GITHUB_TOKEN: ${{ github.token }}';
+  const job = (args) => ct.buildJob(ct.parseArgs(args), {}, { id: 'smoke', head: null });
+  const wf = (args) => job(args).files['.github/workflows/cloudtest.yml'];
+  const on = wf(['--recipe', 'tok-on']);
+  check('githubToken true: the job env has GITHUB_TOKEN = github.token', on.split('\n').includes(LINE), on);
+  const env = on.slice(on.indexOf('    env:\n'), on.indexOf('    steps:'));
+  check('githubToken true: the line sits in the job env, next to CLOUDTEST', env.includes(LINE) && env.includes("CLOUDTEST: '1'"), env);
+  check('githubToken true: permissions stay contents: read', /^permissions:\n {2}contents: read\njobs:/m.test(on), on);
+  check('githubToken true: checkout still has persist-credentials: false', /persist-credentials: false/.test(on));
+  check('githubToken true: options.json says so, without any token value',
+    /"githubToken": "job token/.test(job(['--recipe', 'tok-on']).files['.cloudtest-job/options.json']));
+  for (const n of ['tok-off', 'tok-unset']) {
+    check(`githubToken ${n === 'tok-off' ? 'false' : 'unset'}: no GITHUB_TOKEN anywhere in the workflow`, !/GITHUB_TOKEN|github\.token/.test(wf(['--recipe', n])));
+  }
+  check('no recipe: no GITHUB_TOKEN in the workflow', !/GITHUB_TOKEN|github\.token/.test(wf(['--', 'true'])));
+  let err = null;
+  try { ct.parseArgs(['--recipe', 'tok-bad']); } catch (e) { err = e.message; }
+  check('githubToken must be true or false', err && /"githubToken" must be true or false/.test(err), err);
+}
+try { githubTokenTests(); } catch (e) { check('githubToken section ran without throwing', false, e && e.stack); }
+
 pushTargetTests().catch((e) => check('push-target section ran without throwing', false, e && e.stack)).finally(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\n${passed} passed, ${failed} failed`);

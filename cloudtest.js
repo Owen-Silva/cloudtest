@@ -60,7 +60,7 @@ const LOCAL_RECIPES_DIR = path.resolve(process.env.CLOUDTEST_RECIPES_DIR || path
 const RECIPE_DIRS = [...new Set([LOCAL_RECIPES_DIR, RECIPES_DIR])];
 const RECIPE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RECIPE_KEYS = new Set(['description', 'repo', 'os', 'node', 'python', 'setup', 'setupFile', 'include', 'artifacts',
-  'timeout', 'env', 'command', 'verified', 'shell', 'install', 'display', 'fetchDepth', 'committed']);
+  'timeout', 'env', 'command', 'verified', 'shell', 'install', 'display', 'fetchDepth', 'committed', 'githubToken']);
 const SETUP_FILE_DIR = '.cloudtest'; // setupFile lands at .cloudtest/setup.<ext> in the snapshot
 // --env / recipe env keys whose VALUES are never printed (masked as ***).
 const SECRET_KEY_RE = /secret|token|passw|pwd|key|credential|auth|cookie|session|private|signature|salt|cert/i;
@@ -275,7 +275,7 @@ function loadRecipe(name) {
       throw new CloudtestError(`${from}: "${k}" must be a string or an array of strings`);
     }
   }
-  for (const k of ['install', 'display', 'committed']) {
+  for (const k of ['install', 'display', 'committed', 'githubToken']) {
     if (r[k] != null && typeof r[k] !== 'boolean') throw new CloudtestError(`${from}: "${k}" must be true or false`);
   }
   if (r.env != null && (typeof r.env !== 'object' || Array.isArray(r.env))) throw new CloudtestError(`${from}: "env" must be an object of KEY: value`);
@@ -345,6 +345,7 @@ function applyRecipe(o, r, set) {
   if (r.display != null && !set.has('display')) o.display = r.display;
   if (r.fetchDepth != null && !set.has('fetchDepth')) o.fetchDepth = r.fetchDepth;
   if (r.committed === true) o.committed = true; // a recipe can only turn committed mode ON
+  if (r.githubToken === true) o.githubToken = true; // opt-in: the job's own read-only token as GITHUB_TOKEN
   // Lists: any --include / --artifacts flag REPLACES the recipe's list.
   if (r.include != null && !set.has('include')) o.include = [].concat(r.include).map(normInclude);
   if (r.artifacts != null && !set.has('artifacts')) o.artifacts = [].concat(r.artifacts).flatMap(splitGlobs);
@@ -363,7 +364,7 @@ function parseArgs(argv) {
     display: null, install: true, shell: 'bash', dryRun: false, allowDeploy: false,
     allowPublic: false, command: null, help: false, include: [],
     fetchDepth: null, env: {}, recipeName: null, recipe: null, setupFile: null, listRecipes: false,
-    committed: false, keepRun: false,
+    committed: false, keepRun: false, githubToken: false,
   };
   const set = new Set(); // options given on the command line; they beat recipe fields
   const takesValue = new Set(['--os', '--setup', '--artifacts', '--node', '--python', '--timeout', '--shell', '--include', '--recipe', '--env', '--fetch-depth']);
@@ -654,6 +655,7 @@ function buildJob(o, d, meta) {
     python: usePython ? (o.python || (d.pyVersionFile ? `file:${d.pyVersionFile}` : '3.12')) : null,
     timeoutMinutes: o.timeout, display, install: o.install, include: o.include, command: o.command,
     ...(o.recipe ? { recipe: o.recipe.name } : {}),
+    ...(o.githubToken ? { githubToken: 'job token (contents: read) as GITHUB_TOKEN' } : {}),
     ...(sf ? { setupFile: `${sf.name} -> ${sfPath}` } : {}),
     ...(Object.keys(o.env).length ? { env: maskedEnv(o.env) } : {}),
   }, null, 2) + '\n';
@@ -678,6 +680,9 @@ function buildJob(o, d, meta) {
   y.push('    env:');
   y.push("      CLOUDTEST: '1'");
   y.push("      FORCE_COLOR: '0'");
+  // Recipe "githubToken": true. The job's own token, read-only through permissions above. It is a
+  // ${{ }} expression, so the value never passes through cloudtest; GitHub masks it in the log.
+  if (o.githubToken) y.push('      GITHUB_TOKEN: ${{ github.token }}');
   y.push('    steps:');
   y.push('      - name: Checkout snapshot');
   y.push(`        uses: ${ACTIONS.checkout}`);
@@ -1153,6 +1158,7 @@ async function main() {
   }
   if (o.setupFile) say(`setup file: ${path.basename(o.setupFile.dir)}/${o.setupFile.name} -> ${SETUP_FILE_DIR}/setup.${o.setupFile.ext} (${o.setupFile.ext === 'ps1' ? 'pwsh' : 'bash'}), runs before the setup command`);
   if (Object.keys(o.env).length) say(`env (setup + test steps): ${shownEnv(o.env)}`);
+  if (o.githubToken) say('github token: GITHUB_TOKEN = the job\'s own read-only token (permissions contents: read), from recipe githubToken');
   const now = new Date();
   const stamp = now.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const id = `${stamp}-${crypto.randomBytes(3).toString('hex')}`;
@@ -1339,5 +1345,5 @@ if (require.main === module) {
   );
 } else {
   // required by test/smoke.js: the push-target logic, tested offline against local bare repos
-  module.exports = { canPushByName, pushSnapshot, dropTrackingRef, parseGithubUrl };
+  module.exports = { canPushByName, pushSnapshot, dropTrackingRef, parseGithubUrl, parseArgs, buildJob };
 }
