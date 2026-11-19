@@ -30,7 +30,10 @@ const ARTIFACT_NAME = 'cloudtest-artifacts';
 const MARK_BEGIN = '@@cloudtest-begin@@';
 const MARK_EXIT_RE = /^@@cloudtest-exit=(\d+)@@$/;
 const TOOL_ERROR_EXIT = 125; // cloudtest itself failed before/around the run
-const POLL_MS = 5000;
+// 15 s (was 5 s): each poll is a `gh run view` (2+ API calls), so four runs at once at 5 s used up the
+// 5,000/hour GitHub API limit (2026-11-11). CLOUDTEST_POLL_MS overrides it.
+const POLL_MS = Math.max(2000, Number(process.env.CLOUDTEST_POLL_MS) || 15000);
+const RATE_LIMIT_RE = /rate limit/i;
 const ACTIONS = {
   checkout: 'actions/checkout@v7',
   node: 'actions/setup-node@v7',
@@ -909,16 +912,42 @@ function ghCredArgs(url) {
 }
 const pushEnv = () => ({ ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_OPTIONAL_LOCKS: '0' });
 
+// Push by the remote NAME "origin" only when that provably reaches the one URL repoInfo() vetted:
+// - `git remote get-url --push --all origin` lists exactly one URL, and it is repo.pushUrl itself
+//   (several push URLs would make a by-name push go to every one of them);
+// - that URL parses to the same github.com owner/repo as the fetch URL (repo.name);
+// - no remote.origin.mirror (a mirror remote turns the push into a mirror push, which git
+//   refuses with a refspec) and no remote.origin.vcs (a remote helper, not plain git).
+// Anything else, or any git error: false, and the push goes to the URL as before.
+async function canPushByName(repo) {
+  const cfg = async (key, extra = []) => {
+    const r = await run('git', ['config', ...extra, '--get', key], { cwd: repo.root });
+    return r.code === 0 ? r.stdout.trim() : r.code === 1 ? '' : null; // 1 = unset; other = error
+  };
+  const urls = await run('git', ['remote', 'get-url', '--push', '--all', 'origin'], { cwd: repo.root });
+  if (urls.code !== 0) return false;
+  const list = urls.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (list.length !== 1 || list[0] !== repo.pushUrl) return false;
+  const n = parseGithubUrl(list[0]);
+  if (!n || !repo.name || n.toLowerCase() !== repo.name.toLowerCase()) return false;
+  const mirror = await cfg('remote.origin.mirror', ['--bool']);
+  if (mirror === null || mirror === 'true') return false;
+  const vcs = await cfg('remote.origin.vcs');
+  if (vcs === null || vcs !== '') return false;
+  return true;
+}
+
 async function pushSnapshot(repo, sha, ref, byName) {
   if (!SAFE_REF_RE.test(ref)) throw new CloudtestError(`internal safety stop: refusing to push to ${ref}`);
   if (!/^[0-9a-f]{40,64}$/.test(sha)) throw new CloudtestError('internal safety stop: bad snapshot sha');
-  // Default: push to the URL (not the remote name): no remote-tracking ref is created
-  // locally, and remote.origin.push / mirror config cannot widen the refspec.
-  // --committed pushes to the remote NAME instead, so a pre-push hook knows which remote it is
-  // and can skip the commits that remote already has (HEAD's history, proven pushed); given a
-  // bare URL, a hook cannot tell and rescans the whole history. The explicit refspec still
-  // pushes this one ref (mirror config makes git refuse it). git records a remote-tracking
-  // ref origin/cloudtest/<id> for it, which dropTrackingRef() deletes with the branch.
+  // byName (canPushByName() said yes): push to the remote NAME, so a pre-push hook knows which
+  // remote it is and can skip the commits that remote already has; given a bare URL, a hook
+  // cannot tell and rescans the whole history (an old public test fixture then blocks every
+  // run). Only the local unpushed commits plus the snapshot commit get scanned. The explicit
+  // one-ref refspec overrides remote.origin.push, and canPushByName() refused mirror remotes.
+  // git records a remote-tracking ref origin/cloudtest/<id>, which dropTrackingRef() deletes
+  // with the branch. Otherwise: push to the URL; no remote-tracking ref is created, and no
+  // remote config applies at all. Hooks run either way; cloudtest never passes --no-verify.
   const args = [...ghCredArgs(repo.pushUrl), 'push', '--no-follow-tags', '--recurse-submodules=no', '--quiet',
     byName ? 'origin' : repo.pushUrl, `${sha}:${ref}`];
   const r = await must('git', args, { cwd: repo.root, env: pushEnv(), what: 'git push' });
@@ -928,7 +957,7 @@ async function pushSnapshot(repo, sha, ref, byName) {
   for (const line of hookLines.slice(0, 20)) say(`push: ${line}`);
 }
 
-// --committed only: the remote-tracking ref git wrote for the by-name push. Deleted only while it
+// By-name pushes only: the remote-tracking ref git wrote for the push. Deleted only while it
 // still points at this run's snapshot.
 async function dropTrackingRef(repo, ref, sha) {
   if (!SAFE_REF_RE.test(ref) || !sha) return;
@@ -1027,6 +1056,12 @@ async function watchRun(repo, runId, timeoutMin) {
         if (line !== last) { say(`${fmtDur(Date.now() - t0)} ${line}`); last = line; }
         if (v.status === 'completed') return v;
       }
+    } else if (RATE_LIMIT_RE.test(r.stderr || '')) {
+      // the run keeps going on GitHub; wait the limit out instead of giving up on it (until hardStop)
+      if (last !== 'rate-limited') { warn('GitHub API rate limit reached; waiting for it to reset before polling again'); last = 'rate-limited'; }
+      await sleep(60000);
+      if (Date.now() > hardStop) throw new CloudtestError('lost contact with the run: the GitHub API rate limit did not reset before the run timeout');
+      continue;
     } else if (++fails >= 12) {
       throw new CloudtestError(`lost contact with the run: ${r.stderr.trim().slice(0, 300)}`);
     }
@@ -1156,7 +1191,7 @@ async function main() {
   if (o.dryRun) {
     const d = snap.detect;
     say(`DRY RUN: nothing pushed`);
-    say(`push target: ${repo.fullName} ${ref}${o.committed ? ' (pushed to the remote by name, origin)' : ''}`);
+    say(`push target: ${repo.fullName} ${ref}${(await canPushByName(repo)) ? ' (by remote name origin)' : ' (by URL)'}`);
     if (repo.isPublic) say(`public repo: the run would be ${o.keepRun ? 'KEPT (--keep-run)' : 'deleted from the Actions tab once its log and artifacts are downloaded'}`);
     say(`os ${o.os}  node ${snap.job.useNode ? 'yes' : 'no'}  python ${snap.job.usePython ? 'yes' : 'no'}  lockfile ${d.lockfile || '-'}  ` +
       `xvfb ${snap.job.display ? 'yes' : 'no'}  timeout ${o.timeout}m  command: ${o.command}`);
@@ -1175,6 +1210,7 @@ async function main() {
   writeMeta();
 
   let runInfo = null;
+  let pushedByName = false;
   let branchMaybeExists = false;
   let runDeleted = false;
   let runNoted = false;
@@ -1190,7 +1226,7 @@ async function main() {
       const ok = await deleteRemoteBranch(repo, ref);
       if (ok) say(`deleted remote branch ${branch}`);
       else warn(`could NOT delete remote branch ${branch}; delete it with: git push origin --delete ${branch}`);
-      if (o.committed) await dropTrackingRef(repo, ref, snap.commit);
+      if (pushedByName) await dropTrackingRef(repo, ref, snap.commit);
     }
     if (interrupted) runLeftNote();
   };
@@ -1198,9 +1234,10 @@ async function main() {
   const wall0 = Date.now();
   let exitCode = TOOL_ERROR_EXIT;
   try {
-    say(`push -> ${repo.fullName} ${ref}`);
+    pushedByName = await canPushByName(repo);
+    say(`push -> ${repo.fullName} ${ref}${pushedByName ? ' (by remote name origin)' : ' (by URL)'}`);
     branchMaybeExists = true;
-    await pushSnapshot(repo, snap.commit, ref, o.committed);
+    await pushSnapshot(repo, snap.commit, ref, pushedByName);
     if (aborted) return 130;
 
     runInfo = await findRun(repo, branch, snap.commit);
@@ -1287,15 +1324,20 @@ async function main() {
   }
 }
 
-process.on('SIGINT', () => onSignal('SIGINT'));
-process.on('SIGTERM', () => onSignal('SIGTERM'));
-if (process.platform !== 'win32') process.on('SIGHUP', () => onSignal('SIGHUP'));
+if (require.main === module) {
+  process.on('SIGINT', () => onSignal('SIGINT'));
+  process.on('SIGTERM', () => onSignal('SIGTERM'));
+  if (process.platform !== 'win32') process.on('SIGHUP', () => onSignal('SIGHUP'));
 
-main().then(
-  (code) => { if (!aborted) process.exit(code); },
-  (err) => {
-    if (aborted) return;
-    process.stderr.write(redact(`[cloudtest] ERROR: ${err instanceof CloudtestError ? err.message : (err && err.stack) || err}`) + '\n');
-    process.exit(TOOL_ERROR_EXIT);
-  },
-);
+  main().then(
+    (code) => { if (!aborted) process.exit(code); },
+    (err) => {
+      if (aborted) return;
+      process.stderr.write(redact(`[cloudtest] ERROR: ${err instanceof CloudtestError ? err.message : (err && err.stack) || err}`) + '\n');
+      process.exit(TOOL_ERROR_EXIT);
+    },
+  );
+} else {
+  // required by test/smoke.js: the push-target logic, tested offline against local bare repos
+  module.exports = { canPushByName, pushSnapshot, dropTrackingRef, parseGithubUrl };
+}

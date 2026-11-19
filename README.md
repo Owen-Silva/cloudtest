@@ -149,8 +149,12 @@ several, each one is quoted, so argv is preserved (`cloudtest -- npm test -- --g
    setup at all, its own CI never fires, and the workflow never lands on a real branch.
 3. **Push a throwaway branch.** It pushes the commit to
    `refs/heads/cloudtest/<UTC timestamp>-<random>` with `--no-follow-tags
-   --recurse-submodules=no`. The push goes to the origin URL, not the remote name, so no
-   local remote-tracking ref is created (`--committed` pushes by name; see that section).
+   --recurse-submodules=no`. It pushes to the remote name `origin` when that is provably the
+   same single destination as the vetted push URL (one push URL, the same github.com repo, no
+   mirror or remote-helper config), so a pre-push hook that skips commits origin already has
+   scans only your unpushed commits plus the snapshot, not the whole history. Otherwise it
+   pushes to the URL. Either way the hook runs (cloudtest never passes `--no-verify`), and a
+   by-name push's local remote-tracking ref `origin/cloudtest/<id>` is deleted with the branch.
    `gh`'s token is the credential, so no credential
    manager window opens. *Why:* a unique branch per run lets several runs go in parallel.
 4. **Watch.** It finds the run, then polls it every 5 s and prints one short line each time
@@ -196,10 +200,10 @@ to run a heavy suite there. It also works on private repos (billed as usual).
   (`--keep-run` keeps it). Before deleting, cloudtest saves GitHub's run timing (billable ms
   per OS) to `run.json` and prints it. It prints `billing: public repo, standard runner -> free`
   (or the private-quota note) before the push.
-- **Pushed by remote name** (`origin`), not URL, so a pre-push hook that skips commits the
-  remote already has (a private-info scanner, say) checks only the snapshot commit, not the
-  whole history. Hooks run as usual; cloudtest never passes `--no-verify`. git records a
-  remote-tracking ref `origin/cloudtest/<id>` for the push; cloudtest deletes it with the branch.
+- **Pushed by remote name** (`origin`) when that is safe (see How it works, step 3), so a
+  pre-push hook that skips commits the remote already has (a private-info scanner, say) checks
+  only the snapshot commit, not the whole history. Hooks run as usual; cloudtest never passes
+  `--no-verify`.
 
 ## Recipes
 
